@@ -8,6 +8,7 @@ setup(
     version = '0.1.1',
     packages = find_packages(),
     package_data ={},
+    zip_safe = False,
     install_requires = [
         'Paste',
         'WSGIProxy',

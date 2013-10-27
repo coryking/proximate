@@ -6,7 +6,7 @@ by aggregating multiple hosts into a unified namespace.
 Very useful for JavaScript's Single-Origin Policy.
 """
 
-# TODO: use wsgiref instead of Paste. Or Werkzeug
+# TODO: use wsgiref instead of Paste. Or Werkzeug's run_simple
 # TODO: run http://docs.python.org/2/library/wsgiref.html#wsgiref.validate.validator
 
 import argparse
@@ -34,7 +34,7 @@ class Route(object):
         match = environ['PATH_INFO'].startswith(self.path)
         if match:
             logging.info("Match: path_info='%s', path='%s', remote_url='%s'",
-                            environ['PATH_INFO'], self.path, self.remote_url)
+                         environ['PATH_INFO'], self.path, self.remote_url)
         return match
 
     def strip_path_prefix(self, environ):
@@ -64,7 +64,8 @@ class Route(object):
         app_iter = self.handle_weird_apps(app_iter, captured, written_output)
 
         try:
-            return self.filter_output(environ, start_response, captured[0], captured[1], app_iter)
+            return self.filter_output(
+                environ, start_response, captured[0], captured[1], app_iter)
         finally:
             if hasattr(app_iter, 'close'):
                 app_iter.close()
@@ -83,8 +84,12 @@ class Route(object):
             app_iter = written_output
         return app_iter
 
-    def filter_output(self, environ, start_response, status, response_headers, app_iter):
-        start_response(status, self.rewrite_response_headers(response_headers))
+    def filter_output(
+            self, environ, start_response, status,
+            response_headers, app_iter):
+        start_response(
+            status,
+            self.rewrite_response_headers(response_headers))
         return self.rewrite_response_data(app_iter)
 
     def rewrite_response_headers(self, response_headers):
@@ -99,8 +104,8 @@ class Route(object):
     def rewrite_href(self, target_url):
         rewritten_url = target_url.replace(self.remote_url, self.proxy_url)
 #       logging.info(
-#               "rewrite_href: proxy_url='%s', path='%s', remote_url='%s', target_url='%s' -> %s",
-#               self.proxy_url, self.path, self.remote_url, target_url, rewritten_url)
+#           "rewrite_href: proxy_url='%s', path='%s', remote_url='%s', target_url='%s' -> %s",
+#           self.proxy_url, self.path, self.remote_url, target_url, rewritten_url)
         return rewritten_url
 
     def rewrite_response_data(self, app_iter):
@@ -153,7 +158,11 @@ def proxy_server(ordered_routes, preproxy_url):
     """
     rules = Router.split_args(ordered_routes)
     parts = urlparse.urlsplit(preproxy_url)
-    httpserver.serve(Router(rules, preproxy_url), '0.0.0.0', parts.port)
+    httpserver.serve(
+        Router(rules, preproxy_url),
+        '0.0.0.0',
+        parts.port,
+        use_threadpool=True)
 
 def proximate():
     """Console entrypoint"""
