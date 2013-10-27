@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 """
-Simple HTTP Proxy that emulates the behavior of Apache's ProxyPass
+Simple HTTP Reverse Proxy that emulates the behavior of Apache's ProxyPass
 by aggregating multiple hosts into a unified namespace.
 Very useful for JavaScript's Single-Origin Policy.
 """
@@ -53,16 +53,24 @@ class Route(object):
         captured = []
         written_output = []
 
-        def replacement_start_response(status, response_headers, exc_info=None):
+        def replacement_start_response(
+                status, response_headers, exc_info=None):
             captured[:] = [status, response_headers]
             return written_output.append # WSGI legacy write callable
 
         self.strip_path_prefix(environ)
 
+        # WSGIProxyApp sets multiple X-Forwarded-* headers
+        # but not X-Forwarded-Host. However, werkzeug.wsgi.get_host()
+        # looks at X-Forwarded-Host to construct the canonical hostname.
+        # See http://httpd.apache.org/docs/2.2/mod/mod_proxy.html#x-headers
+        environ['HTTP_X_FORWARDED_HOST'] = self.app.href_netloc
+
         # Make proxied request
         app_iter = self.app(environ, replacement_start_response)
         app_iter = self.handle_weird_apps(app_iter, captured, written_output)
 
+        # Filter the response
         try:
             return self.filter_output(
                 environ, start_response, captured[0], captured[1], app_iter)
@@ -74,7 +82,7 @@ class Route(object):
         if not captured or written_output:
             # This app hasn't called start_response. We can't do
             # anything magic with it; or it used the start_response
-            # writer, and we still can't do anything with it
+            # WRITER, and we still can't do anything with it
             try:
                 for chunk in app_iter:
                     written_output.append(chunk)
