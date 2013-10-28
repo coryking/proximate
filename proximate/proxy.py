@@ -37,19 +37,12 @@ class Route(object):
                          environ['PATH_INFO'], self.path, self.remote_url)
         return match
 
-    def strip_path_prefix(self, environ):
-        old_path = environ['PATH_INFO']
-        assert old_path.startswith(self.path)
-        prefix_len = len(self.path) - (1 if self.path.endswith('/') else 0)
-        new_path = old_path[prefix_len:]
-#       logging.debug("'%s' -> '%s'", old_path, new_path)
-        assert new_path.startswith('/')
-        environ['PATH_INFO'] = new_path
-        return (old_path, new_path)
-
     # Simplified from wsgifilter.filter
     # See also http://wsgi.readthedocs.org/en/latest/specifications/avoiding_serialization.html
     def application(self, environ, start_response):
+        """Subsidiary WSGI application which proxies to `remote_url`
+        and filters the output, making it appear as if it came
+        from this host."""
         captured = []
         written_output = []
 
@@ -59,12 +52,7 @@ class Route(object):
             return written_output.append # WSGI legacy write callable
 
         self.strip_path_prefix(environ)
-
-        # WSGIProxyApp sets multiple X-Forwarded-* headers
-        # but not X-Forwarded-Host. However, werkzeug.wsgi.get_host()
-        # looks at X-Forwarded-Host to construct the canonical hostname.
-        # See http://httpd.apache.org/docs/2.2/mod/mod_proxy.html#x-headers
-        environ['HTTP_X_FORWARDED_HOST'] = self.app.href_netloc
+        self.prepare_environ(environ)
 
         # Make proxied request
         app_iter = self.app(environ, replacement_start_response)
@@ -77,6 +65,25 @@ class Route(object):
         finally:
             if hasattr(app_iter, 'close'):
                 app_iter.close()
+
+    def strip_path_prefix(self, environ):
+        old_path = environ['PATH_INFO']
+        assert old_path.startswith(self.path)
+        prefix_len = len(self.path) - (1 if self.path.endswith('/') else 0)
+        new_path = old_path[prefix_len:]
+#       logging.debug("'%s' -> '%s'", old_path, new_path)
+        assert new_path.startswith('/')
+        environ['PATH_INFO'] = new_path
+        return (old_path, new_path)
+
+    def prepare_environ(self, environ):
+        # WSGIProxyApp sets multiple X-Forwarded-* headers
+        # but not X-Forwarded-Host. However, werkzeug.wsgi.get_host()
+        # looks at X-Forwarded-Host to construct the canonical hostname.
+        # See http://httpd.apache.org/docs/2.2/mod/mod_proxy.html#x-headers
+        
+        # Should this be HTTP_HOST or self.proxy_url on the RHS?
+        environ['HTTP_X_FORWARDED_HOST'] = self.app.href_netloc
 
     def handle_weird_apps(self, app_iter, captured, written_output):
         if not captured or written_output:
@@ -127,7 +134,8 @@ class Router(object):
     Manages a sequence of Routes.
     """
     def __init__(self, ordered_rules, proxy_url):
-        self.ordered_routes = [Route(path, url, proxy_url) for path, url in ordered_rules]
+        self.ordered_routes = [Route(path, url, proxy_url)
+                               for path, url in ordered_rules]
         self.proxy_url = proxy_url
 
     def __call__(self, environ, start_response):
@@ -160,7 +168,7 @@ def proxy_server(ordered_routes, preproxy_url):
 
     :param ordered_routes: a sequence of PATH=URL routes.
 
-    :param url: url to run the server on
+    :param preproxy_url: url to run the server on
 
     Assumed to be HTTP, not HTTPS.
     """
