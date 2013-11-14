@@ -81,9 +81,7 @@ class Route(object):
         # but not X-Forwarded-Host. However, werkzeug.wsgi.get_host()
         # looks at X-Forwarded-Host to construct the canonical hostname.
         # See http://httpd.apache.org/docs/2.2/mod/mod_proxy.html#x-headers
-        
-        # Should this be HTTP_HOST or self.proxy_url on the RHS?
-        environ['HTTP_X_FORWARDED_HOST'] = self.app.href_netloc
+        environ['HTTP_X_FORWARDED_HOST'] = environ['HTTP_HOST']
 
     def handle_weird_apps(self, app_iter, captured, written_output):
         if not captured or written_output:
@@ -156,10 +154,10 @@ class Router(object):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='ProxyPass')
-    parser.add_argument('-U', '--url', 
-                       help='url for the proxy')
+    parser.add_argument('-U', '--url',
+                        help='url for the proxy')
     parser.add_argument('routes', nargs='+',
-                       help='One or more PATH=URL routes')
+                        help='One or more PATH=URL routes')
     return parser.parse_args()
 
 def proxy_server(ordered_routes, preproxy_url):
@@ -173,6 +171,7 @@ def proxy_server(ordered_routes, preproxy_url):
     Assumed to be HTTP, not HTTPS.
     """
     rules = Router.split_args(ordered_routes)
+    print rules
     parts = urlparse.urlsplit(preproxy_url)
     httpserver.serve(
         Router(rules, preproxy_url),
