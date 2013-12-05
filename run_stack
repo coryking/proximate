@@ -1,0 +1,438 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+This pile of code runs a stack of cobs and services
+"""
+
+__author__ = ('Cory King <cory@cozi.com>', 'George V. Reilly <georger@cozi.com>')
+
+import ConfigParser
+import argparse
+import ast
+import datetime
+import logging
+import os
+import signal
+import shlex
+import socket
+import subprocess
+import sys
+import time
+import traceback
+import urlparse
+
+# Cozi packages
+import proxypass
+
+# import cobbler.utils
+# cobbler.utils.monkeypatch_socket_getfqdn()
+
+def traverse_directory(dir, file):
+    found = False
+    last_cwd = None
+    current_dir = dir
+    while not found and last_cwd != current_dir:
+        test_config_file = os.path.join(current_dir, file)
+        if os.path.exists(test_config_file):
+            found = True
+            return test_config_file
+        # Try the next level up
+        last_cwd = current_dir
+        (current_dir, _) = os.path.split(current_dir)
+        if not current_dir:
+            return None
+
+config_dirs = [
+        (os.path.expanduser('~'), '.run_stack.local.ini'),
+        (os.getcwd(), '.run_stack.local.ini'),
+    ]
+
+def read_configs():
+    config_file = None
+    for dir, file in config_dirs:
+        config_file = traverse_directory(dir, file)
+        if config_file:
+            break
+
+    logging.info("Using configuration file at {0}".format(config_file))
+    configs = ConfigParser.ConfigParser()
+    if config_file:
+        configs.read(config_file)
+    return configs
+
+configs = read_configs()
+
+def ensure_trailing_slash(s):
+    return s if s.endswith("/") else "{0}/".format(s)
+
+def parse_args():
+    base_url = 'http://{0}:{{0}}/'.format(socket.getfqdn())
+    def get_base_url_config(key, port):
+        return get_config(key, default=base_url.format(port))
+
+    parser = argparse.ArgumentParser(description="Run Stack",
+            epilog="\nDo you know you can save these arguments to a config file "
+                "so you never have to type them again?  Take a look at --print-config!")
+    defaults = dict(
+        preproxy_url            = get_base_url_config('preproxy_url',      '8192'),
+        web_cli_url             = get_base_url_config('web_cli_url',       '8086'),
+        asp_cli_url             = get_base_url_config('asp_cli_url',       '2175'),
+        web_svc_host_url        = get_base_url_config('web_svc_host_url',  '7007'),
+        meal_svc_host_url       = get_base_url_config('meal_svc_host_url', '8082'),
+        meal_cli_host_url       = get_base_url_config('meal_cli_host_url', '8083'),
+        scenario                = get_config('scenario',               default="cob"),
+        logdir                  = get_config('logdir',
+                                    default=os.path.join(os.getcwd(), '_state/log')),
+        no_load_web_svc_host    = get_config('no_load_web_svc_host',   default=False),
+        no_load_meal_svc_host   = get_config('no_load_meal_svc_host',  default=False),
+        no_load_meal_client     = get_config('no_load_meal_client',    default=False),
+    )
+    parser.set_defaults(**defaults)
+
+    pathing_group = parser.add_argument_group(
+        title="Pathing Options",
+        description="Options for specifying the locations of other services "
+                    "(as seen by a browser)")
+
+    pathing_group.add_argument(
+        '--proxy-url', '-p', dest='preproxy_url',
+        help='Proxy URL, where ProxyPass listens and proxys. '
+             'This is the URL you will actually visit in your browser. '
+             '(default: "%(default)s")')
+    pathing_group.add_argument(
+        '--web-client', '-w', dest='web_cli_url',
+        help='Cob WebClient URL (default: "%(default)s")')
+    pathing_group.add_argument(
+        '--asp-client', '-a', dest='asp_cli_url',
+        help='ASP.NET WebClient URL (default: "%(default)s")')
+    pathing_group.add_argument(
+        '--web-service-host', '-W', dest='web_svc_host_url',
+        help='WebServiceHost URL (default: "%(default)s")')
+    pathing_group.add_argument(
+        '--meal-client-host', '-m', dest='meal_cli_host_url',
+        help='MealClientHost URL (default: "%(default)s")')
+    pathing_group.add_argument(
+        '--meal-service-host', '-M', dest='meal_svc_host_url',
+        help='MealServiceHost URL (default: "%(default)s")')
+
+    dev_group = parser.add_argument_group("Developer Options")
+    dev_group.add_argument(
+        '--log-directory', '-l', dest='logdir',
+        help='A path to some place ProxyPass can write its access and error logs. '
+             '(default: "%(default)s")')
+
+    config_group = parser.add_argument_group("Configuration Options")
+    config_group.add_argument(
+        '--print-config', '-P', dest='print_config', action='store_true',
+        help='Print out the current configuration so you do not have to retype '
+             'these arguments all the time.  Save the output in {}'.format(
+                 " or ".join([os.path.join(*elems) for elems in config_dirs])))
+
+    service_group = parser.add_argument_group("Service Options",
+            "Control what services we attempt to start. "
+            "Perhaps some of them are not running on this server, "
+            "or perhaps you want to control them separately.")
+
+    service_group.add_argument(
+        '--no-web-service', '-x', dest='no_load_web_svc_host', action='store_true',
+        help='Do not attempt to start web service host')
+    service_group.add_argument(
+        '--no-meal-client', '-y', dest='no_load_meal_client', action='store_true',
+        help='Do not attempt to start meal client')
+    service_group.add_argument(
+        '--no-meal-service', '-z', dest='no_load_meal_svc_host', action='store_true',
+        help='Do not attempt to start meal service host')
+
+    scenario_group = parser.add_mutually_exclusive_group()
+    scenario_group.add_argument(
+        '--cob', dest='scenario', action='store_const', const='cob',
+        help='Run a pure Cob WebClient (default: "%(default)s")',
+        default=defaults["scenario"])
+    scenario_group.add_argument(
+        '--asp', dest='scenario', action='store_const', const='asp',
+        help='Run a pure ASP.NET WebClient')
+    scenario_group.add_argument(
+        '--mixed', dest='scenario', action='store_const', const='mixed',
+        help='Run a mixed Cob and ASP.NET WebClient (like production)')
+
+    return (parser.parse_args(), parser)
+
+def virtualenv_root(virtualenv_name):
+    if os.path.abspath(virtualenv_name) == virtualenv_name:
+        return virtualenv_name
+    elif 'WORKON_HOME' in os.environ:
+        return os.path.join(os.environ['WORKON_HOME'], virtualenv_name)
+    else:
+        raise ValueError("Don't know where virtualenv '%s' lives".format(virtualenv_name))
+
+def fake_virtualenv(venv_root):
+    bin_path = r"Scripts;" if (sys.platform == 'win32') else "bin:"
+    env = os.environ.copy()
+    env['VIRTUAL_ENV'] = os.path.abspath(venv_root)
+    env['PATH'] = os.path.join(venv_root, bin_path) + env['PATH']
+    if 'PYTHONHOME' in env:
+        del env['PYTHONHOME']
+    return env
+
+_interesting_env_vars = ('PATH', 'PYTHONPATH', 'VIRTUALENV')
+
+def get_run_items():
+    return [
+        {
+            'name': 'Web Service Host',
+            'port_option': 'web_svc_host_port',
+            'load_option': 'no_load_web_svc_host',
+            'virtualenv': 'kitspython',
+            'cwd': '../kits',
+            'pythonpath': '../kits/output/site-packages',
+            'cmd': 'python ./app/WebServiceHost/coziwebservicehost/server.py '
+                    '--port {web_svc_host_port}',
+        },
+        {
+            'name': 'Meal Client Host',
+            'port_option': 'meal_cli_host_port',
+            'load_option': 'no_load_meal_client',
+            'virtualenv': 'kitspython',
+            'cwd': '../kits',
+            'pythonpath': '../kits/output/site-packages',
+            'cmd': 'python ./app/MealClientHost/cozimealclienthost/server.py '
+                    '--port {meal_cli_host_port} '
+                    '--web-client-url "{web_cli_preproxy_url}" '
+                    '--web-service-url "{web_svc_host_preproxy_url}" '
+                    '--meal-service-url "{meal_svc_host_preproxy_url}"',
+        },
+        {
+            'name': 'Meal Service Host',
+            'port_option': 'meal_svc_host_port',
+            'load_option': 'no_load_meal_svc_host',
+            'virtualenv': 'kitspython',
+            'cwd': '../kits',
+            'pythonpath': '../kits/output/site-packages',
+            'cmd': 'python ./app/MealServiceHost/cozimealservicehost/server.py '
+                    '--port {meal_svc_host_port}',
+        },
+    ]
+
+def launch_process(run_item, options, repl):
+    print("Starting {name} on port {port}...".format(
+        name=run_item['name'], port=repl[run_item['port_option']]))
+    args = shlex.split(run_item['cmd'].format(**repl))
+    cwd = env = None
+    if 'virtualenv' in run_item:
+        env = fake_virtualenv( virtualenv_root(run_item['virtualenv']) )
+        if 'pythonpath' in run_item:
+            env['PYTHONPATH'] = os.path.abspath(run_item['pythonpath'])
+    if 'cwd' in run_item:
+        cwd = os.path.abspath(run_item['cwd'])
+    print "Running <%r> with env=<%r> in cwd=%r" % (
+        args, {e: env[e] for e in env if e in _interesting_env_vars}, cwd)
+    run_item['popen'] = subprocess.Popen(args, env=env, cwd=cwd)
+
+def launch_stack(options, repl):
+    procs = get_run_items()
+
+    option_dict = vars(options)
+    for run_item in procs:
+        # skip if marked to not load
+        skip = None
+        if run_item['load_option'] in option_dict:
+            opt = option_dict[run_item['load_option']]
+            skip = ast.literal_eval(opt) if isinstance(opt, basestring) else opt
+        if skip:
+            print "Not starting {0}".format(run_item['name'])
+            continue
+        launch_process(run_item, options, repl)
+    return procs
+
+def get_config(option, section="stack", default=None):
+    try:
+        return configs.get(section, option)
+    except:
+        return default
+
+def proxy_server(repl):
+    routes = repl["routes"][repl["scenario"]]
+    routes = [r.format(**repl) for r in routes]
+    proxypass.proxy_server(routes, repl["preproxy_url"])
+
+def exit_process(procs):
+    """
+    Exit out of everything...
+    """
+
+    logging.info("Exiting (pid: %s)" % os.getpid())
+    # Kill all processes in our group -- this is useful for the
+    # case when we're running an Erlang child like rabbitmq.  Such
+    # children appear to block SIGINT, but we know who they are,
+    # since they are in our process group.  So we can kill them
+    # this way.  Note this is safe because of the way that Erlang
+    # creates child Unix processes (it calls setpgid on them
+    # before exec'ing, it would seem).
+    for proc in procs:
+        logging.info("Shutting down {0}".format(proc['name']))
+        if 'popen' in proc:
+            proc['popen'].terminate()
+
+def print_config(options):
+        print("""\
+[stack]
+# This is the URL you will actually visit in your browser.
+preproxy_url = {preproxy_url}
+
+# Which scenario to run: cob, asp, or mixed
+scenario = {scenario}
+
+# Cob Web client URL, which proxypass forwards to.
+web_cli_url = {web_cli_url}
+
+# ASP.NET Web client URL, which proxypass forwards to.
+asp_cli_url = {asp_cli_url}
+
+# MealServiceHost URL
+meal_svc_host_url = {meal_svc_host_url}
+
+# MealClientHost URL
+meal_cli_host_url = {meal_cli_host_url}
+
+# WebServiceHost URL
+web_svc_host_url = {web_svc_host_url}
+
+# Logging Directory
+logdir = {logdir}
+
+# If true, do not attempt to load service
+no_load_meal_svc_host = {no_load_meal_svc_host}
+no_load_meal_client = {no_load_meal_client}
+no_load_web_svc_host = {no_load_web_svc_host}
+""".format(**vars(options)))
+
+def create_repl(options):
+    return {
+        "now": datetime.datetime.strftime(datetime.datetime.now(), "%Y-%m-%dT%H:%M:%S"),
+
+        "preproxy_url": ensure_trailing_slash(options.preproxy_url),
+
+        "meal_svc_host_url": ensure_trailing_slash(options.meal_svc_host_url),
+        "meal_svc_host_port": urlparse.urlsplit(options.meal_svc_host_url).port,
+        "meal_svc_host_preproxy_url": urlparse.urljoin(options.preproxy_url, 'meals-api/'),
+
+        "meal_cli_host_url": ensure_trailing_slash(options.meal_cli_host_url),
+        "meal_cli_host_port": urlparse.urlsplit(options.meal_cli_host_url).port,
+        "meal_cli_host_preproxy_url": urlparse.urljoin(options.preproxy_url, 'meals/'),
+
+        "web_svc_host_url": ensure_trailing_slash(options.web_svc_host_url),
+        "web_svc_host_port":  urlparse.urlsplit(options.web_svc_host_url).port,
+        "web_svc_host_preproxy_url": urlparse.urljoin(options.preproxy_url, 'rest/'),
+
+        "web_cli_url": ensure_trailing_slash(options.web_cli_url),
+        "asp_cli_url": ensure_trailing_slash(options.asp_cli_url),
+        "client_url_logon": urlparse.urljoin(options.preproxy_url, 'logon/'),
+        "web_cli_preproxy_url": ensure_trailing_slash(options.preproxy_url),
+
+        "log_dir": os.path.abspath(options.logdir),
+        "routes": {
+            "cob": [
+                "/meals-api/={meal_svc_host_url}",
+                "/meals/={meal_cli_host_url}",
+                "/rest/={web_svc_host_url}rest",
+                "/={web_cli_url}",
+            ],
+            "asp": [
+                "/meals-api/={meal_svc_host_url}",
+                "/meals/={meal_cli_host_url}",
+                "/rest/={web_svc_host_url}rest",
+                "/={asp_cli_url}",
+            ],
+            "mixed": [
+                "/meals-api/={meal_svc_host_url}",
+                "/meals/={meal_cli_host_url}",
+                "/rest/={web_svc_host_url}rest",
+                "/settings/={web_cli_url}settings",
+                "/journal/={web_cli_url}journal",
+                "/messages/={web_cli_url}messages",
+                "/todo/={web_cli_url}todo",
+                "/shopping/={web_cli_url}shopping",
+                "/calendar/={web_cli_url}calendar",
+                "/contacts/={web_cli_url}contacts",
+                "/homepage/={web_cli_url}homepage",
+                "/output/={web_cli_url}output",
+                "/cob/={web_cli_url}cob",
+                "/={asp_cli_url}",
+            ],
+        },
+        "scenario": options.scenario,
+    }
+
+def banner(repl):
+    return """
+======================================================================
+Everything Should Be Ready!
+----------------------------------------------------------------------
+Assuming all the services loaded properly, you should be ready to
+log into the web client and get started!
+
+  Root:       {preproxy_url}
+
+Note: you do need to run WebClientCob's "main.py" in a separate window.
+
+----------------------------------------------------------------------
+Pro Tip:
+----------------------------------------------------------------------
+Tired of typing in the same arguments over and over? Save your config!
+
+>> ./run_stack.py [args] --print-config > ./.run_stack.local.ini
+
+""".format(**repl)
+
+def make_logger(logdir, filename):
+    if not os.path.exists(logdir):
+        os.makedirs(logdir)
+    fh = logging.FileHandler(os.path.join(logdir, filename))
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fh.setFormatter(formatter)
+    if logging.root.handlers:
+        logging.root.handlers = []
+    logging.root.addHandler(fh)
+    logging.root.setLevel(logging.DEBUG)
+
+
+if __name__ == '__main__':
+    (options, parser) = parse_args()
+
+    repl = create_repl(options)
+
+    make_logger(options.logdir, 'run_stack.log')
+
+    if options.print_config:
+        print_config(options)
+        sys.exit(0)
+
+    print("Launching Application Stack...")
+    procs = launch_stack(options, repl)
+    delay = 2
+    print("Waiting for about {0} seconds before moving on".format(delay))
+    time.sleep(delay)
+    print banner(repl)
+
+    def signal_handler(signal, frame):
+        print("Ctrl+C Detected, tearing it all down!")
+        exit_process(procs)
+        print("This script hopes you enjoyed running it.  Please have a good day!")
+        sys.exit(0)
+
+
+#   signal.signal(signal.SIGINT, signal_handler)
+    print("Hit Ctrl+C to shut everything down and exit")
+#   signal.pause()
+
+    try:
+        proxy_server(repl)
+    except (KeyboardInterrupt, SystemExit) as ex:
+        logging.exception(ex)
+    except Exception as ex:
+        logging.exception(ex)
+        traceback.print_stack()
+        raise
+    finally:
+        exit_process(procs)
