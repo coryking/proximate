@@ -63,3 +63,6 @@ tags
 TAGS
 
 setup.cfg
+
+# Sphinx documentation
+docs/_build/

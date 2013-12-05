@@ -6,6 +6,11 @@
 Welcome to Proximate's documentation!
 =====================================
 
+Proximate_ is a Simple HTTP Reverse Proxy that emulates the behavior of Apache's ProxyPass
+by aggregating multiple hosts into a unified namespace.
+Very useful for JavaScript's Single-Origin Policy.
+
+
 Contents:
 
 .. toctree::
@@ -20,3 +25,5 @@ Indices and tables
 * :ref:`modindex`
 * :ref:`search`
 
+.. _Proximate:
+    https://github.com/cozi/proximate
